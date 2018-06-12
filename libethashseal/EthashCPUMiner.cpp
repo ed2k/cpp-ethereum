@@ -73,6 +73,7 @@ void EthashCPUMiner::workLoop()
 			this_thread::sleep_for(chrono::milliseconds(500));
 		dag = EthashAux::full(w.seedHash, false);
 	}
+
 	h256 boundary = w.boundary;
 	unsigned hashCount = 1;
 	for (; !shouldStop(); tryNonce++, hashCount++)

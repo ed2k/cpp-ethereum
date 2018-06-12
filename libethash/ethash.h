@@ -32,7 +32,8 @@
 #define ETHASH_CACHE_BYTES_INIT 1073741824U // 2**24
 #define ETHASH_CACHE_BYTES_GROWTH 131072U  // 2**17
 #define ETHASH_EPOCH_LENGTH 30000U
-#define ETHASH_MIX_BYTES 256
+#define ETHASH_MIX_BYTES 128
+#define ETHASH_MIX_BYTES_256 256
 #define ETHASH_HASH_BYTES 64
 #define ETHASH_DATASET_PARENTS 256
 #define ETHASH_CACHE_ROUNDS 3
@@ -121,6 +122,7 @@ void ethash_full_delete(ethash_full_t full);
  * @param full           The full client handler
  * @param header_hash    The header hash to pack into the mix
  * @param nonce          The nonce to pack into the mix
+ * @param blockNumber    current ethereum block number
  * @return               An object of ethash_return_value to hold the return value
  */
 ethash_return_value_t ethash_full_compute(

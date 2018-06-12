@@ -182,6 +182,117 @@ bool ethash_compute_full_data(
 	return true;
 }
 
+static bool ethash_hash(
+	ethash_return_value_t* ret,
+	node const* full_nodes,
+	ethash_light_t const light,
+	uint64_t full_size,
+	ethash_h256_t const header_hash,
+	uint64_t const nonce
+)
+{
+	if (full_size % MIX_WORDS != 0) {
+		return false;
+	}
+
+	// pack hash and nonce together into first 40 bytes of s_mix
+	assert(sizeof(node) * 8 == 512);
+	node s_mix[MIX_NODES + 1];
+	memcpy(s_mix[0].bytes, &header_hash, 32);
+	fix_endian64(s_mix[0].double_words[4], nonce);
+
+	// compute sha3-512 hash and replicate across mix
+	SHA3_512(s_mix->bytes, s_mix->bytes, 40);
+	fix_endian_arr32(s_mix[0].words, 16);
+
+	node* const mix = s_mix + 1;
+	for (uint32_t w = 0; w != MIX_WORDS; ++w) {
+		mix->words[w] = s_mix[0].words[w % NODE_WORDS];
+	}
+
+	unsigned const page_size = sizeof(uint32_t) * MIX_WORDS;
+	unsigned const num_full_pages = (unsigned) (full_size / page_size);
+
+	for (unsigned i = 0; i != ETHASH_ACCESSES; ++i) {
+		uint32_t const index = fnv_hash(s_mix->words[0] ^ i, mix->words[i % MIX_WORDS]) % num_full_pages;
+
+		for (unsigned n = 0; n != MIX_NODES; ++n) {
+			node const* dag_node;
+			node tmp_node;
+			if (full_nodes) {
+				dag_node = &full_nodes[MIX_NODES * index + n];
+			} else {
+				ethash_calculate_dag_item(&tmp_node, index * MIX_NODES + n, light);
+				dag_node = &tmp_node;
+			}
+
+#if defined(_M_X64) && ENABLE_SSE
+			{
+				__m128i fnv_prime = _mm_set1_epi32(FNV_PRIME);
+				__m128i xmm0 = _mm_mullo_epi32(fnv_prime, mix[n].xmm[0]);
+				__m128i xmm1 = _mm_mullo_epi32(fnv_prime, mix[n].xmm[1]);
+				__m128i xmm2 = _mm_mullo_epi32(fnv_prime, mix[n].xmm[2]);
+				__m128i xmm3 = _mm_mullo_epi32(fnv_prime, mix[n].xmm[3]);
+				mix[n].xmm[0] = _mm_xor_si128(xmm0, dag_node->xmm[0]);
+				mix[n].xmm[1] = _mm_xor_si128(xmm1, dag_node->xmm[1]);
+				mix[n].xmm[2] = _mm_xor_si128(xmm2, dag_node->xmm[2]);
+				mix[n].xmm[3] = _mm_xor_si128(xmm3, dag_node->xmm[3]);
+			}
+			#elif defined(__MIC__)
+			{
+				// __m512i implementation via union
+				//	Each vector register (zmm) can store sixteen 32-bit integer numbers
+				__m512i fnv_prime = _mm512_set1_epi32(FNV_PRIME);
+				__m512i zmm0 = _mm512_mullo_epi32(fnv_prime, mix[n].zmm[0]);
+				mix[n].zmm[0] = _mm512_xor_si512(zmm0, dag_node->zmm[0]);
+			}
+			#else
+			{
+				for (unsigned w = 0; w != NODE_WORDS; ++w) {
+					mix[n].words[w] = fnv_hash(mix[n].words[w], dag_node->words[w]);
+				}
+			}
+#endif
+		}
+
+	}
+
+// Workaround for a GCC regression which causes a bogus -Warray-bounds warning.
+// The regression was introduced in GCC 4.8.4, fixed in GCC 5.0.0 and backported to GCC 4.9.3 but
+// never to the GCC 4.8.x line.
+//
+// See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=56273
+//
+// This regression is affecting Debian Jesse (8.5) builds of cpp-ethereum (GCC 4.9.2) and also
+// manifests in the doublethinkco armel v5 cross-builds, which use crosstool-ng and resulting
+// in the use of GCC 4.8.4.  The Tizen runtime wants an even older GLIBC version - the one from
+// GCC 4.6.0!
+
+#if defined(__GNUC__) && (__GNUC__ < 5)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif // define (__GNUC__)
+
+	// compress mix
+	for (uint32_t w = 0; w != MIX_WORDS; w += 4) {
+		uint32_t reduction = mix->words[w + 0];
+		reduction = reduction * FNV_PRIME ^ mix->words[w + 1];
+		reduction = reduction * FNV_PRIME ^ mix->words[w + 2];
+		reduction = reduction * FNV_PRIME ^ mix->words[w + 3];
+		mix->words[w / 4] = reduction;
+	}
+
+#if defined(__GNUC__) && (__GNUC__ < 5)
+#pragma GCC diagnostic pop
+#endif // define (__GNUC__)
+
+	fix_endian_arr32(mix->words, MIX_WORDS / 4);
+	memcpy(&ret->mix_hash, mix->bytes, 32);
+	// final Keccak hash
+	SHA3_256(&ret->result, s_mix->bytes, 64 + 32); // Keccak-256(s + compressed_mix)
+	return true;
+}
+
 //***************************************************************
 //***************************************************************
 typedef struct
@@ -480,7 +591,7 @@ void progPowLoop(
     }
 }
 
-static bool ethash_hash(
+static bool progpow_hash(
 	ethash_return_value_t* ret,
 	node const* full_nodes,
 	ethash_light_t const light,
@@ -490,9 +601,9 @@ static bool ethash_hash(
 	uint64_t const blockNumber
 )
 {
-    
+
     const uint64_t *g_dag = (uint64_t *) full_nodes;
-   
+
     const hash32_t header;
     memcpy((void *)&header, (void *)&header_hash, sizeof(header_hash));
     uint32_t c_dag[PROGPOW_CACHE_WORDS];
@@ -526,7 +637,7 @@ static bool ethash_hash(
     for (int l = 0; l < PROGPOW_LANES; l++)
         fill_mix(seed, l, mix[l]);
 
-    uint32_t dagWords = (unsigned)(full_size / ETHASH_MIX_BYTES);
+    uint32_t dagWords = (unsigned)(full_size / ETHASH_MIX_BYTES_256);
     // execute the randomly generated inner loop
     for (int i = 0; i < PROGPOW_CNT_MEM; i++)
     {
@@ -551,62 +662,11 @@ static bool ethash_hash(
     for (int l = 0; l < PROGPOW_LANES; l++)
         fnv1a(&result[l%4], lane_hash[l]);
 
-    
     memset((void *)&ret->mix_hash, 0, sizeof(ret->mix_hash));
-    memcpy(&ret->mix_hash, result, sizeof(result));   
+    memcpy(&ret->mix_hash, result, sizeof(result));
     memset((void *)&ret->result, 0, sizeof(ret->result));
     keccak_f800(header, seed, result);
     memcpy((void *)&ret->result, (void *)&header, sizeof(ret->result));
-
-
-//	if (full_size % MIX_WORDS != 0) {
-//		return false;
-//	}
-//
-//	// pack hash and nonce together into first 40 bytes of s_mix
-//	assert(sizeof(node) * 8 == 512);
-//	node s_mix[MIX_NODES + 1];
-//	memcpy(s_mix[0].bytes, &header_hash, 32);
-//	fix_endian64(s_mix[0].double_words[4], nonce);
-//
-//	// compute sha3-512 hash and replicate across mix
-//	SHA3_512(s_mix->bytes, s_mix->bytes, 40);
-//	fix_endian_arr32(s_mix[0].words, 16);
-//
-//	node* const mix = s_mix + 1;
-//	for (uint32_t w = 0; w != MIX_WORDS; ++w) {
-//		mix->words[w] = s_mix[0].words[w % NODE_WORDS];
-//	}
-//
-//	unsigned const page_size = sizeof(uint32_t) * MIX_WORDS;
-//	unsigned const num_full_pages = (unsigned) (full_size / page_size);
-//
-//	for (unsigned i = 0; i != ETHASH_ACCESSES; ++i) {
-//		uint32_t const index = fnv_hash(s_mix->words[0] ^ i, mix->words[i % MIX_WORDS]) % num_full_pages;
-//
-//		for (unsigned n = 0; n != MIX_NODES; ++n) {
-//			node const* dag_node;
-//			node tmp_node;
-//			if (full_nodes) {
-//				dag_node = &full_nodes[MIX_NODES * index + n];
-//			} else {
-//				ethash_calculate_dag_item(&tmp_node, index * MIX_NODES + n, light);
-//				dag_node = &tmp_node;
-//			}
-//
-//			{
-//				for (unsigned w = 0; w != NODE_WORDS; ++w) {
-//					mix[n].words[w] = fnv_hash(mix[n].words[w], dag_node->words[w]);
-//				}
-//			}
-//		}
-//
-//	}
-//
-//	fix_endian_arr32(mix->words, MIX_WORDS / 4);
-//	memcpy(&ret->mix_hash, mix->bytes, 32);
-//	// final Keccak hash
-//	SHA3_256(&ret->result, s_mix->bytes, 64 + 32); // Keccak-256(s + compressed_mix)
 	return true;
 }
 
@@ -705,14 +765,20 @@ ethash_return_value_t ethash_light_compute_internal(
 	ethash_light_t light,
 	uint64_t full_size,
 	ethash_h256_t const header_hash,
-	uint64_t nonce
+	uint64_t nonce, uint64_t blockNumber
 )
 {
   	ethash_return_value_t ret;
 	ret.success = true;
-	if (!ethash_hash(&ret, NULL, light, full_size, header_hash, nonce, 0)) {
+if (blockNumber < 4000000) {
+	if (!ethash_hash(&ret, NULL, light, full_size, header_hash, nonce)) {
 		ret.success = false;
 	}
+} else {
+	if (!progpow_hash(&ret, NULL, light, full_size, header_hash, nonce, 0)) {
+		ret.success = false;
+	}
+}
 	return ret;
 }
 
@@ -723,7 +789,8 @@ ethash_return_value_t ethash_light_compute(
 )
 {
 	uint64_t full_size = ethash_get_datasize(light->block_number);
-	return ethash_light_compute_internal(light, full_size, header_hash, nonce);
+	return ethash_light_compute_internal(light, full_size, header_hash, nonce,
+	    light->block_number);
 }
 
 static bool ethash_mmap(struct ethash_full* ret, FILE* f)
@@ -870,7 +937,18 @@ ethash_return_value_t ethash_full_compute(
 {
 	ethash_return_value_t ret;
 	ret.success = true;
+if (blockNumber < 4000000) {
 	if (!ethash_hash(
+		&ret,
+		(node const*)full->data,
+		NULL,
+		full->file_size,
+		header_hash,
+		nonce)) {
+		ret.success = false;
+	}
+} else {
+	if (!progpow_hash(
 		&ret,
 		(node const*)full->data,
 		NULL,
@@ -880,6 +958,7 @@ ethash_return_value_t ethash_full_compute(
 		blockNumber)) {
 		ret.success = false;
 	}
+}
 	return ret;
 }
 
